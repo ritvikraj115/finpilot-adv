@@ -1,5 +1,6 @@
 // client/src/components/InsightsNew.jsx
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { getSocket } from '../socket';
 import styled from 'styled-components';
 
 // Import only the chart‐rendering component from react-chartjs-2
@@ -163,6 +164,7 @@ const daysInMonth = (yyyyMm) => {
 export default function InsightsNew() {
   // 1) Manage Month selector
   const today = new Date();
+  const socketRef = useRef(null);
   const defaultMonth = `${today.getFullYear()}-${String(
     today.getMonth() + 1
   ).padStart(2, '0')}`;
@@ -246,8 +248,22 @@ export default function InsightsNew() {
 
       // 2) /insights/predict → { prediction }
       const pRes = await api.get(`${process.env.REACT_APP_BACKEND_URL}/insights/predict`);
-      setPredicted(pRes.data.prediction);
-      setdaywise(pRes.data.daywise)
+      setPredicted(pRes.data.prediction ?? null);
+      setDaywiseSafe(pRes.data.daywise ?? []);
+      setAvgTxn(pRes.data.avgTxnsPerDay ?? null);
+      if (pRes.data.model_run_id) setModelRunId(pRes.data.model_run_id);
+      // safe setter for daywise ensuring array of numbers
+      const setDaywiseSafe = (arr) => {
+        if (!Array.isArray(arr)) {
+          setDaywise([]);
+          return;
+        }
+        const nums = arr.map((v) => {
+          const n = Number(v);
+          return Number.isNaN(n) ? 0 : n;
+        });
+        setDaywise(nums);
+      };
       setAvgTxn(pRes.data.avgTxnsPerDay)
 
       const resCat = await api.get(`${process.env.REACT_APP_BACKEND_URL}/insights/categories`);
@@ -427,6 +443,48 @@ export default function InsightsNew() {
     }
   }, [planner, predicted]);
 
+  // --- Socket: subscribe to realtime forecast events
+useEffect(() => {
+  const socket = getSocket();
+  socketRef.current = socket;
+
+  const onForecast = (evt) => {
+    try {
+      if (!evt) return;
+      // Expected shape: { event_type:'forecast', model_run_id, user_id, daywise, total, timestamp }
+      if (evt.daywise) setDaywiseSafe(evt.daywise);
+      if (evt.total != null) setPredicted(Number(evt.total));
+      if (evt.model_run_id) setModelRunId(evt.model_run_id);
+      if (evt.timestamp) setLastUpdated(evt.timestamp);
+      else setLastUpdated(new Date().toISOString());
+    } catch (e) {
+      console.error('Error handling forecast event', e);
+    }
+  };
+
+  socket.on('forecast.prediction', onForecast);
+  socket.on('prediction', (payload) => {
+    if (payload && payload.event_type === 'forecast') onForecast(payload);
+  });
+
+  socket.on('connect', () => {
+    // optional: server may auto-join user room based on JWT
+  });
+
+  socket.on('connect_error', (err) => {
+    console.warn('socket connect_error', err?.message || err);
+  });
+
+  return () => {
+    if (!socket) return;
+    socket.off('forecast.prediction', onForecast);
+    socket.off('prediction', onForecast);
+    socketRef.current = null;
+  };
+// eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
+
 
   const renderAIAdvisorText = () => {
     // a) If budget or predicted is still undefined:
@@ -461,14 +519,30 @@ export default function InsightsNew() {
     // e) Fallback: if no insights returned, show nothing (or you can revert to old text)
     return null;
   };
- const adjustedShuffled = useMemo(() => {
-    const arr = daywise.map(amount => amount * avgTxn);
-    for (let i = arr.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [arr[i], arr[j]] = [arr[j], arr[i]];
+const adjustedShuffled = useMemo(() => {
+  const base = (Array.isArray(daywise) ? daywise.slice(0, 7) : []);
+  let arr;
+  if (Array.isArray(base) && base.length > 0) {
+    if (avgTxn != null && !Number.isNaN(Number(avgTxn))) {
+      arr = base.map((amount) => Number(amount) * Number(avgTxn));
+    } else {
+      arr = base.map((amount) => Number(amount));
     }
-    return arr.slice(0, 7); // ensure exactly 7 values
-  }, [daywise, avgTxn]);
+  } else {
+    arr = new Array(7).fill(0);
+  }
+
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  if (arr.length < 7) {
+    const pad = new Array(7 - arr.length).fill(0);
+    arr = arr.concat(pad);
+  }
+  return arr.slice(0, 7);
+}, [daywise, avgTxn]);
+
 
   // 2) Generate the next 7 calendar dates (YYYY‑MM‑DD) in order
   const next7Dates = useMemo(() => {

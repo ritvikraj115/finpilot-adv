@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from tensorflow.keras.models import load_model
+from kafka_producer import publish as kafka_publish
 
 # config.py constants
 from config import SEQ_LEN, HORIZON, FEATURE_COLS, MODEL_PATH as CFG_MODEL_PATH, SCALER_PATH as CFG_SCALER_PATH, FILE_PATH
@@ -19,6 +20,10 @@ MODEL_METADATA_PATH = os.environ.get('MODEL_METADATA_PATH', 'model_metadata.json
 FORECAST_SERVICE_HOST = os.environ.get('FORECAST_SERVICE_HOST', '0.0.0.0')
 FORECAST_SERVICE_PORT = int(os.environ.get('FORECAST_SERVICE_PORT', 8000))
 CATEGORY_MODEL_PATH = os.environ.get('CATEGORY_MODEL_PATH', '../../models/expense_category_model.pkl')
+RETRAIN_TOPIC = os.environ.get('TOPIC_RETRAIN', 'finpilot.model.retrain')
+PREDICTIONS_TOPIC = os.environ.get('TOPIC_PREDICTIONS', 'finpilot.predictions')
+MODEL_REGISTRY_TOPIC = os.environ.get('TOPIC_MODEL_REGISTRY', 'finpilot.model.registry')
+SERVICE_NAME = os.environ.get('FORECAST_SERVICE_NAME', 'forecast-service')
 
 # Initialize Flask app once
 app = Flask(__name__)
@@ -84,6 +89,7 @@ def load_model_and_scaler_from_metadata():
 # Load model/scaler at startup (best-effort)
 load_model_and_scaler_from_metadata()
 
+
 # CATEGORY MODEL helpers (lazy load)
 def load_category_model():
     global CATEGORY_MODEL
@@ -129,6 +135,7 @@ def forecast():
     Expects JSON input with:
       {
         "series": [numeric values],    # historical daily totals (most recent last)
+        "user_id": "<optional user id>",
         // "dates" is optional; if not provided, dates are assumed to be consecutive days ending today
       }
 
@@ -145,6 +152,7 @@ def forecast():
     data = request.get_json(force=True)
     series = data.get('series')
     dates = data.get('dates', None)
+    user_id = data.get('user_id') or request.headers.get('X-User-Id') or None
 
     # Validate series
     if not isinstance(series, list) or len(series) < SEQ_LEN:
@@ -191,6 +199,29 @@ def forecast():
 
         amount = float(sum(forecast))
 
+        # Build prediction event for Kafka
+        pred_event = {
+            'event_type': 'forecast',
+            'service': SERVICE_NAME,
+            'model_run_id': CURRENT_MODEL_RUN_ID,
+            'user_id': str(user_id) if user_id else None,
+            'timestamp': datetime.utcnow().isoformat(),
+            'horizon': HORIZON,
+            'daywise': forecast,
+            'total': amount,
+            'metadata': {
+                'seq_len': SEQ_LEN,
+                'n_input_days': len(series)
+            }
+        }
+
+        # Use user_id as key if present so events for same user go to same partition (ordering)
+        key = pred_event['user_id'] or None
+        try:
+            kafka_publish(PREDICTIONS_TOPIC, key, pred_event)
+        except Exception as e:
+            print('[forecast_service] warning: failed to publish prediction event to kafka:', e)
+
         return jsonify({
             "daywise": forecast,
             "forecast": amount,
@@ -205,41 +236,69 @@ def forecast():
 @app.route('/retrain', methods=['POST'])
 def retrain():
     """
-    Convenience endpoint to retrain the model from posted series (or using internal data).
-    In production we will trigger retrains via Kafka and a retrain worker; keep this for local/manual usage.
+    Trigger retrain: by default, publishes a retrain request to Kafka and returns 202.
+    For local/dev testing, pass ?sync=1 to run the pipeline synchronously and return results.
     """
     data = request.get_json(silent=True) or {}
-    series = data.get('series', [])
-
-    if not isinstance(series, list):
-        # allow empty body to trigger pipeline on existing FILE_PATH as well
-        series = []
+    series = data.get('series', None)
 
     # Basic validation if provided
-    if series and (len(series) < 30 or len(series) > 365):
+    if series is not None and (not isinstance(series, list) or len(series) < 30 or len(series) > 365):
         return jsonify({'error': 'Series must be a list of 30–365 numeric values.'}), 400
 
-    # If a series is provided, construct and save it to FILE_PATH so pipeline uses it
+    # If series provided, construct and save it to FILE_PATH so pipeline uses it
     if series:
-        start_date = datetime.today() - timedelta(days=len(series) - 1)
-        dates = pd.date_range(start=start_date, periods=len(series))
-        df = pd.DataFrame({'Date / Time': dates, 'Debit/Credit': series})
-        df.set_index('Date / Time', inplace=True)
-        # Save to configured FILE_PATH used by pipeline
-        df.to_excel(FILE_PATH)
-        print(f'[forecast_service] saved training file to {FILE_PATH} (rows={len(series)})')
+        try:
+            start_date = datetime.today() - timedelta(days=len(series) - 1)
+            dates = pd.date_range(start=start_date, periods=len(series))
+            df = pd.DataFrame({'Date / Time': dates, 'Debit/Credit': series})
+            df.set_index('Date / Time', inplace=True)
+            # Save to configured FILE_PATH used by pipeline
+            df.to_excel(FILE_PATH)
+            print(f'[forecast_service] saved training file to {FILE_PATH} (rows={len(series)})')
+        except Exception as e:
+            return jsonify({'error': 'Failed to save series for retrain', 'details': str(e)}), 500
 
-    # Run pipeline (synchronous). In production, prefer publishing retrain request to Kafka.
+    event = {
+        'model_name': 'forecast',
+        'requested_by': request.headers.get('X-User-Id') or request.headers.get('Authorization') or 'unknown',
+        'params': data.get('params', {}),
+        'training_data_path': data.get('training_data_path', FILE_PATH if series else None),
+        'timestamp': datetime.utcnow().isoformat()
+    }
+
+    # Synchronous (blocking) path useful for local dev/testing: /retrain?sync=1
+    if request.args.get('sync') == '1':
+        try:
+            from forecast_pipeline import run_pipeline
+            meta = run_pipeline()
+            # after run, publish registry event so other services receive it (retrain_worker normally does this)
+            try:
+                registry_msg = {
+                    'model_name': 'forecast',
+                    'run_id': meta.get('run_id'),
+                    'local_model_path': meta.get('local_model_path'),
+                    'scaler_path': meta.get('scaler_path'),
+                    'metrics': meta.get('metrics', {}),
+                    'timestamp': meta.get('timestamp')
+                }
+                kafka_publish(MODEL_REGISTRY_TOPIC, registry_msg.get('model_name'), registry_msg)
+            except Exception as e:
+                print('[forecast_service] warning: failed to publish registry event after sync run:', e)
+            # reload model on this service
+            load_model_and_scaler_from_metadata()
+            return jsonify({'status': 'retraining complete', 'meta': meta})
+        except Exception as e:
+            print('[forecast_service] retrain failed (sync):', e)
+            return jsonify({'error': 'retrain failed', 'details': str(e)}), 500
+
+    # Async path: publish retrain request to Kafka and return 202
     try:
-        # Lazy import to avoid circular import problems
-        from forecast_pipeline import run_pipeline
-        meta = run_pipeline()
-        # After pipeline finishes, reload model/scaler
-        load_model_and_scaler_from_metadata()
-        return jsonify({'status': 'retraining complete', 'meta': meta})
+        kafka_publish(RETRAIN_TOPIC, event.get('model_name'), event)
+        return jsonify({'status': 'retrain requested', 'event': event}), 202
     except Exception as e:
-        print('[forecast_service] retrain failed:', e)
-        return jsonify({'error': 'retrain failed', 'details': str(e)}), 500
+        print('[forecast_service] failed to publish retrain event:', e)
+        return jsonify({'error': 'failed to publish retrain event', 'details': str(e)}), 500
 
 
 @app.route('/reload_model', methods=['POST'])
@@ -262,3 +321,4 @@ def reload_model():
 if __name__ == '__main__':
     # Use explicit host/port from env or defaults
     app.run(host=FORECAST_SERVICE_HOST, port=FORECAST_SERVICE_PORT)
+
