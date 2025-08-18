@@ -1,0 +1,16 @@
+{
+  "$id": "https://finpilot.local/schemas/prediction_envelope.json",
+  "type": "object",
+  "required": ["version", "event_type", "source", "event_id", "timestamp", "payload"],
+  "properties": {
+    "version": { "type": "string" },
+    "event_type": { "type": "string", "enum": ["classification", "forecast", "model.registry", "other"] },
+    "source": { "type": "string" },
+    "event_id": { "type": "string" },
+    "user_id": { "type": ["string", "null"] },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "model_run_id": { "type": ["string", "null"] },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": true
+}

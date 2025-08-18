@@ -193,20 +193,25 @@ that this transaction fulfills. If none match, respond with [].
             console.warn('[consumer] planner update failed (non-fatal):', plannerErr.message || plannerErr);
           }
 
-          // 4) Publish prediction event for downstream services / UI
+          // 4) Publish classification prediction event for downstream services / UI
           try {
-            await publishPrediction({
+            const rawPayload = {
               transaction_id,
-              user_id,
-              category,
+              predicted_category: category,
               confidence,
-              model_run_id,
-              timestamp: new Date().toISOString()
-            });
-            console.log('[consumer] published prediction event for', transaction_id);
+              amount,
+              currency
+            };
+            const topic = process.env.TOPIC_PREDICTIONS || 'finpilot.predictions';
+            const key = user_id ? String(user_id) : String(transaction_id);
+            // opts helps makeEnvelope infer source/model_run_id etc.
+            const opts = { event_type: 'classification', source: 'transactions-consumer', event_id: transaction_id, user_id, model_run_id };
+            await publishPrediction(topic, rawPayload, key, opts);
+            console.log('[consumer] published classification prediction event for', transaction_id, '-> topic=', topic);
           } catch (pubErr) {
             console.warn('[consumer] publishPrediction failed (non-fatal):', pubErr.message || pubErr);
           }
+
 
           // Success -> break retry loop
           return;

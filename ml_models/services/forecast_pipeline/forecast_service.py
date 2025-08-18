@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import joblib
 from tensorflow.keras.models import load_model
+
+# import your python kafka publisher (expects publish(topic, payload, key=None, **opts))
 from kafka_producer import publish as kafka_publish
 
 # config.py constants
@@ -152,6 +154,7 @@ def forecast():
     data = request.get_json(force=True)
     series = data.get('series')
     dates = data.get('dates', None)
+    # Prefer explicit user_id field or header fallback
     user_id = data.get('user_id') or request.headers.get('X-User-Id') or None
 
     # Validate series
@@ -199,16 +202,14 @@ def forecast():
 
         amount = float(sum(forecast))
 
-        # Build prediction event for Kafka
-        pred_event = {
-            'event_type': 'forecast',
-            'service': SERVICE_NAME,
-            'model_run_id': CURRENT_MODEL_RUN_ID,
+        # Build prediction event payload (raw payload; publisher will envelope)
+        pred_payload = {
             'user_id': str(user_id) if user_id else None,
-            'timestamp': datetime.utcnow().isoformat(),
             'horizon': HORIZON,
             'daywise': forecast,
             'total': amount,
+            'model_run_id': CURRENT_MODEL_RUN_ID,
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
             'metadata': {
                 'seq_len': SEQ_LEN,
                 'n_input_days': len(series)
@@ -216,9 +217,18 @@ def forecast():
         }
 
         # Use user_id as key if present so events for same user go to same partition (ordering)
-        key = pred_event['user_id'] or None
+        key = pred_payload['user_id'] or None
         try:
-            kafka_publish(PREDICTIONS_TOPIC, key, pred_event)
+            # publish(topic, payload, key=None, **opts)
+            kafka_publish(
+                PREDICTIONS_TOPIC,
+                pred_payload,
+                key=key,
+                event_type='forecast',
+                source=SERVICE_NAME,
+                model_run_id=CURRENT_MODEL_RUN_ID,
+                user_id=pred_payload['user_id']
+            )
         except Exception as e:
             print('[forecast_service] warning: failed to publish prediction event to kafka:', e)
 
@@ -264,7 +274,7 @@ def retrain():
         'requested_by': request.headers.get('X-User-Id') or request.headers.get('Authorization') or 'unknown',
         'params': data.get('params', {}),
         'training_data_path': data.get('training_data_path', FILE_PATH if series else None),
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': datetime.utcnow().isoformat() + 'Z'
     }
 
     # Synchronous (blocking) path useful for local dev/testing: /retrain?sync=1
@@ -280,9 +290,18 @@ def retrain():
                     'local_model_path': meta.get('local_model_path'),
                     'scaler_path': meta.get('scaler_path'),
                     'metrics': meta.get('metrics', {}),
-                    'timestamp': meta.get('timestamp')
+                    'timestamp': meta.get('timestamp') or datetime.utcnow().isoformat() + 'Z'
                 }
-                kafka_publish(MODEL_REGISTRY_TOPIC, registry_msg.get('model_name'), registry_msg)
+                # publish registry message (publisher will envelope)
+                kafka_publish(
+                    MODEL_REGISTRY_TOPIC,
+                    registry_msg,
+                    key=str(registry_msg.get('run_id') or ''),
+                    event_type='model.registry',
+                    source=SERVICE_NAME,
+                    event_id=registry_msg.get('run_id'),
+                    model_run_id=registry_msg.get('run_id')
+                )
             except Exception as e:
                 print('[forecast_service] warning: failed to publish registry event after sync run:', e)
             # reload model on this service
@@ -294,7 +313,13 @@ def retrain():
 
     # Async path: publish retrain request to Kafka and return 202
     try:
-        kafka_publish(RETRAIN_TOPIC, event.get('model_name'), event)
+        kafka_publish(
+            RETRAIN_TOPIC,
+            event,
+            key=str(event.get('model_name') or ''),
+            event_type='model.retrain',
+            source=SERVICE_NAME
+        )
         return jsonify({'status': 'retrain requested', 'event': event}), 202
     except Exception as e:
         print('[forecast_service] failed to publish retrain event:', e)
@@ -321,4 +346,5 @@ def reload_model():
 if __name__ == '__main__':
     # Use explicit host/port from env or defaults
     app.run(host=FORECAST_SERVICE_HOST, port=FORECAST_SERVICE_PORT)
+
 
