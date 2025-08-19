@@ -2,6 +2,7 @@
 # Flask service for sequence-to-sequence LSTM forecasting
 import os
 import json
+import threading
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
@@ -10,6 +11,7 @@ import numpy as np
 import pandas as pd
 import joblib
 from tensorflow.keras.models import load_model
+import requests
 
 # import your python kafka publisher (expects publish(topic, payload, key=None, **opts))
 from kafka_producer import publish as kafka_publish
@@ -27,11 +29,17 @@ PREDICTIONS_TOPIC = os.environ.get('TOPIC_PREDICTIONS', 'finpilot.predictions')
 MODEL_REGISTRY_TOPIC = os.environ.get('TOPIC_MODEL_REGISTRY', 'finpilot.model.registry')
 SERVICE_NAME = os.environ.get('FORECAST_SERVICE_NAME', 'forecast-service')
 
-# Initialize Flask app once
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Admin API (server) used to read ModelRegistry info (active per-user/global)
+ADMIN_API = os.environ.get('ADMIN_API') or os.environ.get('SERVER_ADMIN_URL') or 'http://localhost:5000/api/admin'
+# Internal secret expected on protected internal calls (optional)
+INTERNAL_SECRET = os.environ.get('INTERNAL_SECRET')
 
-# Globals that hold loaded models/scalers and run id
+# Cache / concurrency settings
+MODEL_CACHE_MAX = int(os.environ.get('MODEL_CACHE_MAX', '20'))
+MODEL_CACHE_LOCK = threading.Lock()  # guard MODEL_CACHE operations
+MODEL_CACHE = {}  # structure: { user_id: { model:..., scaler:..., run_id:..., last_used: ts } }
+
+# Globals that hold loaded models/scalers and run id (global fallback)
 MODEL_OBJ = None
 SCALER_OBJ = None
 CURRENT_MODEL_RUN_ID = None
@@ -47,10 +55,57 @@ SCALER_PATH = CFG_SCALER_PATH
 CATEGORY_MODEL = None
 
 
+def load_keras_model_safe(path):
+    """
+    Attempt to load a Keras model from path; returns model or raises
+    """
+    return load_model(path)
+
+
+def load_scaler_safe(path):
+    """
+    Load a scaler using joblib; returns scaler or raises
+    """
+    return joblib.load(path)
+
+
+def load_model_and_scaler_paths(model_path, scaler_path):
+    """
+    Try to load model and scaler from given filesystem paths.
+    Returns tuple (model_obj, scaler_obj). Raises if both can't be loaded.
+    """
+    model_obj = None
+    scaler_obj = None
+    errors = []
+    if not model_path:
+        errors.append('model_path missing')
+    else:
+        try:
+            model_obj = load_keras_model_safe(model_path)
+            print(f"[forecast_service] loaded keras model from {model_path}")
+        except Exception as e:
+            errors.append(f"model load failed: {e}")
+
+    if not scaler_path:
+        errors.append('scaler_path missing')
+    else:
+        try:
+            scaler_obj = load_scaler_safe(scaler_path)
+            print(f"[forecast_service] loaded scaler from {scaler_path}")
+        except Exception as e:
+            errors.append(f"scaler load failed: {e}")
+
+    if model_obj is None or scaler_obj is None:
+        raise RuntimeError("Failed to load model/scaler: " + "; ".join(errors))
+
+    return model_obj, scaler_obj
+
+
 def load_model_and_scaler_from_metadata():
     """
     If MODEL_METADATA_PATH exists and contains local_model_path/scaler_path/run_id,
     prefer those. Otherwise fall back to MODEL_PATH / SCALER_PATH from config.
+    This sets the global MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID (global fallback).
     """
     global MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID, MODEL_PATH, SCALER_PATH
     model_path = MODEL_PATH
@@ -61,34 +116,24 @@ def load_model_and_scaler_from_metadata():
         try:
             with open(MODEL_METADATA_PATH, 'r') as f:
                 meta = json.load(f)
-            # prefer meta local paths if provided
             model_path = meta.get('local_model_path') or model_path
             scaler_path = meta.get('scaler_path') or scaler_path
-            run_id = meta.get('run_id') or meta.get('mlflow_run') or meta.get('run')
+            run_id = meta.get('run_id') or meta.get('mlflow_run') or meta.get('run') or run_id
             print(f"[forecast_service] using metadata model_path={model_path}, scaler_path={scaler_path}, run_id={run_id}")
         except Exception as e:
             print("[forecast_service] failed to read metadata file:", e)
 
-    # attempt to load Keras model
     try:
-        MODEL_OBJ = load_model(model_path)
-        print(f"[forecast_service] loaded model from {model_path}")
+        MODEL_OBJ, SCALER_OBJ = load_model_and_scaler_paths(model_path, scaler_path)
     except Exception as e:
         MODEL_OBJ = None
-        print(f"[forecast_service] failed to load model at {model_path}: {e}")
-
-    # attempt to load scaler
-    try:
-        SCALER_OBJ = joblib.load(scaler_path)
-        print(f"[forecast_service] loaded scaler from {scaler_path}")
-    except Exception as e:
         SCALER_OBJ = None
-        print(f"[forecast_service] failed to load scaler at {scaler_path}: {e}")
+        print(f"[forecast_service] failed to load default model/scaler from {model_path},{scaler_path}: {e}")
 
     CURRENT_MODEL_RUN_ID = run_id
 
 
-# Load model/scaler at startup (best-effort)
+# Load default model/scaler at startup (best-effort)
 load_model_and_scaler_from_metadata()
 
 
@@ -103,6 +148,140 @@ def load_category_model():
             CATEGORY_MODEL = None
             print(f"[forecast_service] failed to load category model at {CATEGORY_MODEL_PATH}: {e}")
     return CATEGORY_MODEL
+
+
+# ----------------- Per-user model helpers -----------------
+def _evict_if_needed_locked():
+    """
+    Evict least-recently-used entries if cache exceeds MODEL_CACHE_MAX.
+    Caller must hold MODEL_CACHE_LOCK.
+    """
+    if len(MODEL_CACHE) <= MODEL_CACHE_MAX:
+        return
+    # Sort by last_used ascending and remove oldest entries until below threshold
+    items = sorted(MODEL_CACHE.items(), key=lambda kv: kv[1].get('last_used', 0))
+    while len(MODEL_CACHE) > MODEL_CACHE_MAX:
+        key_to_remove, _ = items.pop(0)
+        entry = MODEL_CACHE.pop(key_to_remove, None)
+        print(f"[forecast_service] evicted model cache for user={key_to_remove} run_id={entry.get('run_id') if entry else 'n/a'}")
+
+
+def get_cached_model_for_user(user_id, run_id):
+    """
+    Return (model, scaler, run_id) if cached & matches run_id (or any if run_id is None).
+    Updates last_used timestamp.
+    """
+    with MODEL_CACHE_LOCK:
+        entry = MODEL_CACHE.get(str(user_id))
+        if not entry:
+            return None, None, None
+        # If run_id specified and mismatch, consider it not usable
+        if run_id and entry.get('run_id') != run_id:
+            return None, None, None
+        # update last used
+        entry['last_used'] = datetime.utcnow().timestamp()
+        return entry.get('model'), entry.get('scaler'), entry.get('run_id')
+
+
+def set_cached_model_for_user(user_id, model_obj, scaler_obj, run_id):
+    """
+    Store model/scaler in cache for the user.
+    """
+    with MODEL_CACHE_LOCK:
+        MODEL_CACHE[str(user_id)] = {
+            'model': model_obj,
+            'scaler': scaler_obj,
+            'run_id': run_id,
+            'last_used': datetime.utcnow().timestamp()
+        }
+        _evict_if_needed_locked()
+
+
+def fetch_active_model_metadata_for_user(user_id):
+    """
+    Ask Admin API for active model for user; falls back to global active if not found.
+    Returns metadata dict or None. Expected fields include run_id, local_model_path, scaler_path.
+    """
+    try:
+        params = {'model_name': 'forecast'}
+        if user_id:
+            params['user_id'] = str(user_id)
+        url = f"{ADMIN_API.rstrip('/')}/models/active"
+        res = requests.get(url, params=params, timeout=6)
+        if res.ok:
+            data = res.json()
+            # admin may return {} or doc; when empty return None
+            if not data:
+                # fallback: if we requested user-specific and got none, ask for global (without user_id)
+                if user_id:
+                    res2 = requests.get(url, params={'model_name': 'forecast'}, timeout=6)
+                    if res2.ok and res2.json():
+                        return res2.json()
+                return None
+            return data
+        else:
+            print(f"[forecast_service] admin API returned non-200 for active model: {res.status_code} {res.text}")
+            return None
+    except Exception as e:
+        print("[forecast_service] failed to query admin API for active model:", e)
+        return None
+
+
+def load_and_cache_model_for_user(user_id, metadata):
+    """
+    Given admin metadata dict with local_model_path & scaler_path & run_id, attempt to load and cache for user.
+    Returns (model_obj, scaler_obj, run_id) or (None,None,None) on failure.
+    """
+    if not metadata:
+        return None, None, None
+    run_id = metadata.get('run_id') or metadata.get('runId') or metadata.get('run')
+    model_path = metadata.get('local_model_path') or metadata.get('localModelPath') or metadata.get('local_path') or ''
+    scaler_path = metadata.get('scaler_path') or metadata.get('scalerPath') or metadata.get('scaler_path') or ''
+    if not run_id or not model_path or not scaler_path:
+        print("[forecast_service] metadata missing required fields for user model load:", metadata)
+        return None, None, None
+    try:
+        model_obj, scaler_obj = load_model_and_scaler_paths(model_path, scaler_path)
+        set_cached_model_for_user(user_id, model_obj, scaler_obj, run_id)
+        return model_obj, scaler_obj, run_id
+    except Exception as e:
+        print(f"[forecast_service] failed to load & cache user model run_id={run_id} for user={user_id}: {e}")
+        return None, None, None
+
+
+def get_model_for_user(user_id):
+    """
+    High-level: return (model_obj, scaler_obj, run_id) to be used for forecasting for this user.
+    Strategy:
+      1. If user_id is falsy -> return global MODEL_OBJ/SCALER_OBJ and CURRENT_MODEL_RUN_ID.
+      2. If there is an entry in MODEL_CACHE -> return it.
+      3. Query Admin API for active user model; if found, load & cache it and return.
+      4. Fallback to global MODEL_OBJ/SCALER_OBJ.
+    """
+    global MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID
+
+    if not user_id:
+        return MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID
+
+    # check cache first (no run_id constraint)
+    model_obj, scaler_obj, run_id = get_cached_model_for_user(user_id, run_id=None)
+    if model_obj and scaler_obj:
+        return model_obj, scaler_obj, run_id
+
+    # fetch active metadata from admin
+    metadata = fetch_active_model_metadata_for_user(user_id)
+    if metadata:
+        m_obj, s_obj, r_id = load_and_cache_model_for_user(user_id, metadata)
+        if m_obj and s_obj:
+            return m_obj, s_obj, r_id
+
+    # fallback to global
+    return MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID
+
+
+# ----------------- Flask app routes -----------------
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 
 @app.route('/predict', methods=['POST'])
@@ -121,8 +300,6 @@ def predict():
         return jsonify({'error': 'Description is required'}), 400
 
     try:
-        # If your model expects tokenized vectors, you must preprocess the description before predict.
-        # Here we call predict directly as your previous code did — adjust as needed.
         pred = model.predict([description])
         category = pred[0]
         return jsonify({'category': category})
@@ -149,12 +326,9 @@ def forecast():
         "model_run_id": <run_id or null>
       }
     """
-    global MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID
-
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     series = data.get('series')
     dates = data.get('dates', None)
-    # Prefer explicit user_id field or header fallback
     user_id = data.get('user_id') or request.headers.get('X-User-Id') or None
 
     # Validate series
@@ -176,39 +350,43 @@ def forecast():
     df['dow'] = df.index.dayofweek
     df['is_weekend'] = (df['dow'] >= 5).astype(int)
 
-    if SCALER_OBJ is None or MODEL_OBJ is None:
-        # Attempt to reload once more if models weren't present at startup
+    # Resolve model & scaler for this user (may be per-user or global)
+    model_obj, scaler_obj, model_run_id = get_model_for_user(user_id)
+
+    if scaler_obj is None or model_obj is None:
+        # attempt to reload global metadata fallback
         load_model_and_scaler_from_metadata()
-        if SCALER_OBJ is None or MODEL_OBJ is None:
+        model_obj, scaler_obj, model_run_id = MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID
+        if scaler_obj is None or model_obj is None:
             return jsonify({'error': 'server model not loaded; try again later'}), 503
 
     try:
-        # Scale features
+        # Scale features using the resolved scaler
         feat_vals = df[FEATURE_COLS].values
-        scaled_vals = SCALER_OBJ.transform(feat_vals)
+        scaled_vals = scaler_obj.transform(feat_vals)
 
         # Prepare last sequence window
         last_seq = scaled_vals[-SEQ_LEN:]
         input_seq = last_seq.reshape(1, SEQ_LEN, len(FEATURE_COLS))
 
         # Predict next HORIZON days
-        pred_scaled = MODEL_OBJ.predict(input_seq)[0, :, 0]
+        pred_scaled = model_obj.predict(input_seq)[0, :, 0]
 
         # Invert scaling and log transformation
         dummy = np.zeros((HORIZON, len(FEATURE_COLS)))
         dummy[:, 0] = pred_scaled
-        inv = SCALER_OBJ.inverse_transform(dummy)[:, 0]  # back to log_amt
-        forecast = np.expm1(inv).tolist()
+        inv = scaler_obj.inverse_transform(dummy)[:, 0]  # back to log_amt
+        forecast_vals = np.expm1(inv).tolist()
 
-        amount = float(sum(forecast))
+        total_amount = float(sum(forecast_vals))
 
         # Build prediction event payload (raw payload; publisher will envelope)
         pred_payload = {
             'user_id': str(user_id) if user_id else None,
             'horizon': HORIZON,
-            'daywise': forecast,
-            'total': amount,
-            'model_run_id': CURRENT_MODEL_RUN_ID,
+            'daywise': forecast_vals,
+            'total': total_amount,
+            'model_run_id': model_run_id,
             'timestamp': datetime.utcnow().isoformat() + 'Z',
             'metadata': {
                 'seq_len': SEQ_LEN,
@@ -226,17 +404,17 @@ def forecast():
                 key=key,
                 event_type='forecast',
                 source=SERVICE_NAME,
-                model_run_id=CURRENT_MODEL_RUN_ID,
+                model_run_id=model_run_id,
                 user_id=pred_payload['user_id']
             )
         except Exception as e:
             print('[forecast_service] warning: failed to publish prediction event to kafka:', e)
 
         return jsonify({
-            "daywise": forecast,
-            "forecast": amount,
+            "daywise": forecast_vals,
+            "forecast": total_amount,
             "horizon_days": HORIZON,
-            "model_run_id": CURRENT_MODEL_RUN_ID
+            "model_run_id": model_run_id
         })
     except Exception as e:
         print('[forecast_service] forecast error:', e)
@@ -248,9 +426,12 @@ def retrain():
     """
     Trigger retrain: by default, publishes a retrain request to Kafka and returns 202.
     For local/dev testing, pass ?sync=1 to run the pipeline synchronously and return results.
+    Accepts optional JSON:
+      { series: [...], params: {...}, user_id: '...' }
     """
     data = request.get_json(silent=True) or {}
     series = data.get('series', None)
+    requested_user_id = data.get('user_id') or data.get('requested_user_id') or None
 
     # Basic validation if provided
     if series is not None and (not isinstance(series, list) or len(series) < 30 or len(series) > 365):
@@ -272,6 +453,7 @@ def retrain():
     event = {
         'model_name': 'forecast',
         'requested_by': request.headers.get('X-User-Id') or request.headers.get('Authorization') or 'unknown',
+        'requested_user_id': requested_user_id,
         'params': data.get('params', {}),
         'training_data_path': data.get('training_data_path', FILE_PATH if series else None),
         'timestamp': datetime.utcnow().isoformat() + 'Z'
@@ -290,7 +472,8 @@ def retrain():
                     'local_model_path': meta.get('local_model_path'),
                     'scaler_path': meta.get('scaler_path'),
                     'metrics': meta.get('metrics', {}),
-                    'timestamp': meta.get('timestamp') or datetime.utcnow().isoformat() + 'Z'
+                    'timestamp': meta.get('timestamp') or datetime.utcnow().isoformat() + 'Z',
+                    'user_id': requested_user_id
                 }
                 # publish registry message (publisher will envelope)
                 kafka_publish(
@@ -300,11 +483,12 @@ def retrain():
                     event_type='model.registry',
                     source=SERVICE_NAME,
                     event_id=registry_msg.get('run_id'),
-                    model_run_id=registry_msg.get('run_id')
+                    model_run_id=registry_msg.get('run_id'),
+                    user_id=requested_user_id
                 )
             except Exception as e:
                 print('[forecast_service] warning: failed to publish registry event after sync run:', e)
-            # reload model on this service
+            # reload model on this service (reload default metadata file)
             load_model_and_scaler_from_metadata()
             return jsonify({'status': 'retraining complete', 'meta': meta})
         except Exception as e:
@@ -318,7 +502,8 @@ def retrain():
             event,
             key=str(event.get('model_name') or ''),
             event_type='model.retrain',
-            source=SERVICE_NAME
+            source=SERVICE_NAME,
+            user_id=requested_user_id
         )
         return jsonify({'status': 'retrain requested', 'event': event}), 202
     except Exception as e:
@@ -331,14 +516,56 @@ def reload_model():
     """
     Internal endpoint: ask service to reload the latest model and scaler.
     Intended to be called by your ModelRegistry consumer after a retrain completes.
+    Accepts JSON: { run_id: '<run_id>' } to load a specific run (global fallback).
     Protect this endpoint in production (internal secret or mutual TLS).
     """
     try:
         payload = request.get_json(silent=True) or {}
         requested_run = payload.get('run_id')
-        # We ignore requested_run for now and simply reload metadata-based model
-        load_model_and_scaler_from_metadata()
-        return jsonify({'ok': True, 'run_id': CURRENT_MODEL_RUN_ID})
+        # Check internal secret header if configured
+        if INTERNAL_SECRET:
+            header_secret = request.headers.get('X-Internal-Secret')
+            if header_secret != INTERNAL_SECRET:
+                return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+
+        # If run_id provided: fetch metadata from admin API and attempt to load & set as global
+        if requested_run:
+            try:
+                url = f"{ADMIN_API.rstrip('/')}/models"
+                params = {'run_id': requested_run}
+                resp = requests.get(url, params=params, timeout=10)
+                if resp.ok:
+                    data = resp.json()
+                    # admin GET /models may return array or object; handle both
+                    meta = None
+                    if isinstance(data, list):
+                        meta = data[0] if len(data) > 0 else None
+                    elif isinstance(data, dict):
+                        meta = data
+                    if meta and meta.get('local_model_path') and meta.get('scaler_path'):
+                        try:
+                            mobj, scobj = load_model_and_scaler_paths(meta['local_model_path'], meta['scaler_path'])
+                            # set as global fallback
+                            global MODEL_OBJ, SCALER_OBJ, CURRENT_MODEL_RUN_ID
+                            MODEL_OBJ = mobj
+                            SCALER_OBJ = scobj
+                            CURRENT_MODEL_RUN_ID = meta.get('run_id') or meta.get('run') or requested_run
+                            print(f"[forecast_service] reloaded global model from registry run {CURRENT_MODEL_RUN_ID}")
+                            return jsonify({'ok': True, 'run_id': CURRENT_MODEL_RUN_ID})
+                        except Exception as e:
+                            print('[forecast_service] failed to load model from metadata fetched from admin API:', e)
+                            return jsonify({'ok': False, 'error': 'failed to load model', 'details': str(e)}), 500
+                    else:
+                        return jsonify({'ok': False, 'error': 'no metadata found for run_id'}), 404
+                else:
+                    return jsonify({'ok': False, 'error': 'admin API error', 'status': resp.status_code, 'text': resp.text}), 500
+            except Exception as e:
+                print('[forecast_service] error fetching metadata from admin API for reload:', e)
+                return jsonify({'ok': False, 'error': 'admin fetch failed', 'details': str(e)}), 500
+        else:
+            # No run_id: reload from local metadata file (unchanged behavior)
+            load_model_and_scaler_from_metadata()
+            return jsonify({'ok': True, 'run_id': CURRENT_MODEL_RUN_ID})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -346,5 +573,6 @@ def reload_model():
 if __name__ == '__main__':
     # Use explicit host/port from env or defaults
     app.run(host=FORECAST_SERVICE_HOST, port=FORECAST_SERVICE_PORT)
+
 
 

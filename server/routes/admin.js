@@ -53,4 +53,54 @@ router.delete('/dlq/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// create
+router.post('/models', async (req, res) => {
+  try {
+    const doc = await ModelRegistry.create(req.body);
+    return res.status(201).json(doc);
+  } catch (e) {
+    console.error('admin: failed to create model registry', e);
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+// list/filter
+router.get('/models', async (req, res) => {
+  const q = {};
+  if (req.query.model_name) q.model_name = req.query.model_name;
+  if (req.query.user_id) q.user_id = req.query.user_id;
+  const docs = await ModelRegistry.find(q).sort({ created_at: -1 }).limit(200);
+  return res.json(docs);
+});
+
+// activate
+router.post('/models/:run_id/activate', async (req, res) => {
+  const { run_id } = req.params;
+  const { user_id } = req.body; // may be null => global
+  try {
+    // deactivate previous for that user+model_name
+    const doc = await ModelRegistry.findOne({ run_id });
+    if (!doc) return res.status(404).json({ error: 'not found' });
+    await ModelRegistry.updateMany({ model_name: doc.model_name, user_id: user_id || null }, { active: false });
+    doc.active = true; doc.user_id = user_id || null;
+    await doc.save();
+    return res.json(doc);
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+// get active
+router.get('/models/active', async (req, res) => {
+  const { model_name, user_id } = req.query;
+  // prefer user-specific
+  let doc = null;
+  if (user_id) {
+    doc = await ModelRegistry.findOne({ model_name, user_id }).sort({ created_at: -1 });
+  }
+  if (!doc) {
+    doc = await ModelRegistry.findOne({ model_name, user_id: null, active: true }).sort({ created_at: -1 });
+  }
+  return res.json(doc || {});
+});
 module.exports = router;
