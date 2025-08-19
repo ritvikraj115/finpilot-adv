@@ -1,19 +1,26 @@
 // server/routes/admin.js
 const express = require('express');
 const router = express.Router();
+
 const DLQMessage = require('../models/DLQMessage');
+const ModelRegistry = require('../models/ModelRegistry');   // <-- MISSING import added
 const { publishTransaction } = require('../kafka/producer'); // re-use existing producer for retries
 
-// NOTE: This endpoint is NOT authenticated here — in your repo protect it behind admin auth in prod.
+// NOTE: Protect these endpoints in prod (auth/mTLS/API key)
 
+// ------------------ DLQ ROUTES ------------------
+
+// List recent DLQ items
 router.get('/dlq', async (req, res, next) => {
   try {
-    const q = {};
-    const items = await DLQMessage.find(q).sort({ received_at: -1 }).limit(200);
+    const items = await DLQMessage.find({})
+      .sort({ received_at: -1 })
+      .limit(200);
     res.json(items);
   } catch (err) { next(err); }
 });
 
+// Get a specific DLQ item
 router.get('/dlq/:id', async (req, res, next) => {
   try {
     const item = await DLQMessage.findById(req.params.id);
@@ -22,18 +29,19 @@ router.get('/dlq/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Retry a DLQ item by republishing its original event back to transactions topic.
-// This increments retry_count and sets retried_at.
+// Retry a DLQ item by republishing its original event
 router.post('/dlq/:id/retry', async (req, res, next) => {
   try {
     const item = await DLQMessage.findById(req.params.id);
     if (!item) return res.status(404).json({ error: 'not found' });
 
-    // original event is in item.value.original_event OR item.value
-    const payload = item.value && item.value.original_event ? item.value.original_event : item.value;
+    const payload =
+      item.value && item.value.original_event
+        ? item.value.original_event
+        : item.value;
+
     if (!payload) return res.status(400).json({ error: 'no original event to retry' });
 
-    // republish using publishTransaction (works in mock mode or real Kafka)
     await publishTransaction(payload);
 
     item.retry_count = (item.retry_count || 0) + 1;
@@ -45,7 +53,7 @@ router.post('/dlq/:id/retry', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// Optionally delete DLQ item
+// Delete a DLQ item
 router.delete('/dlq/:id', async (req, res, next) => {
   try {
     await DLQMessage.findByIdAndDelete(req.params.id);
@@ -53,7 +61,9 @@ router.delete('/dlq/:id', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-// create
+// ------------------ MODEL REGISTRY ROUTES ------------------
+
+// Create a model registry entry
 router.post('/models', async (req, res) => {
   try {
     const doc = await ModelRegistry.create(req.body);
@@ -64,43 +74,73 @@ router.post('/models', async (req, res) => {
   }
 });
 
-// list/filter
+// List/filter models
 router.get('/models', async (req, res) => {
-  const q = {};
-  if (req.query.model_name) q.model_name = req.query.model_name;
-  if (req.query.user_id) q.user_id = req.query.user_id;
-  const docs = await ModelRegistry.find(q).sort({ created_at: -1 }).limit(200);
-  return res.json(docs);
+  try {
+    const q = {};
+    if (req.query.model_name) q.model_name = req.query.model_name;
+    if (req.query.user_id) q.user_id = req.query.user_id;
+    const docs = await ModelRegistry.find(q).sort({ created_at: -1 }).limit(200);
+    return res.json(docs);
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
+  }
 });
 
-// activate
+// Activate a model run for given user/global
 router.post('/models/:run_id/activate', async (req, res) => {
   const { run_id } = req.params;
-  const { user_id } = req.body; // may be null => global
+  const { user_id } = req.body; // null => global
   try {
-    // deactivate previous for that user+model_name
     const doc = await ModelRegistry.findOne({ run_id });
     if (!doc) return res.status(404).json({ error: 'not found' });
-    await ModelRegistry.updateMany({ model_name: doc.model_name, user_id: user_id || null }, { active: false });
-    doc.active = true; doc.user_id = user_id || null;
+
+    // deactivate any existing active for this (model_name,user_id)
+    await ModelRegistry.updateMany(
+      { model_name: doc.model_name, user_id: user_id || null, active: true },
+      { $set: { active: false, status: 'inactive' } }
+    );
+
+    doc.active = true;
+    doc.user_id = user_id || null;
+    doc.status = 'active';
+    doc.activated_at = new Date();
     await doc.save();
+
     return res.json(doc);
   } catch (e) {
     return res.status(500).json({ error: String(e) });
   }
 });
 
-// get active
+// Get active model (prefer user-specific, else global)
 router.get('/models/active', async (req, res) => {
-  const { model_name, user_id } = req.query;
-  // prefer user-specific
-  let doc = null;
-  if (user_id) {
-    doc = await ModelRegistry.findOne({ model_name, user_id }).sort({ created_at: -1 });
+  try {
+    const { model_name, user_id } = req.query;
+    if (!model_name) return res.status(400).json({ error: 'model_name is required' });
+
+    let doc = null;
+    if (user_id) {
+      doc = await ModelRegistry.findOne({
+        model_name,
+        user_id,
+        active: true
+      }).sort({ activated_at: -1 });
+    }
+
+    if (!doc) {
+      doc = await ModelRegistry.findOne({
+        model_name,
+        user_id: null,
+        active: true
+      }).sort({ activated_at: -1 });
+    }
+
+    return res.json(doc || {});
+  } catch (e) {
+    return res.status(500).json({ error: String(e) });
   }
-  if (!doc) {
-    doc = await ModelRegistry.findOne({ model_name, user_id: null, active: true }).sort({ created_at: -1 });
-  }
-  return res.json(doc || {});
 });
+
 module.exports = router;
+
